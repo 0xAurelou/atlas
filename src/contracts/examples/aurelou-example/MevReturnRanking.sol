@@ -8,8 +8,8 @@ import { IERC20 } from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol"
 // Atlas Imports
 import { DAppControl } from "src/contracts/dapp/DAppControl.sol";
 import { CallConfig } from "src/contracts/types/ConfigTypes.sol";
-import "src/contracts/types/UserOperation.sol";
-import "src/contracts/types/SolverOperation.sol";
+import { UserOperation } from "src/contracts/types/UserOperation.sol";
+import { SolverOperation } from "src/contracts/types/SolverOperation.sol";
 
 // Uniswap Imports
 import {
@@ -18,6 +18,8 @@ import {
 } from "src/contracts/examples/aurelou-example/interfaces/IUniswapV2Router.sol";
 
 import { IMevReturnRanking } from "src/contracts/examples/aurelou-example/interfaces/IMevReturnRanking.sol";
+
+import { ILending } from "src/contracts/examples/aurelou-example/interfaces/ILending.sol";
 
 /*
 * @title CombinedDAppControl
@@ -28,19 +30,17 @@ contract CombinedDAppControl is DAppControl {
     address public immutable REWARD_TOKEN;
     address public immutable uniswapV2Router02;
 
+    // Ranking variables
+    address private _userLock = address(1); // TODO: Convert to transient storage
+
+    uint256 public constant ONE_BPS_BASIS = 10_000;
+
     //   Selector   Boolean
     mapping(bytes4 => bool) public ERC20StartingSelectors;
     //   Selector   Boolean
     mapping(bytes4 => bool) public ETHStartingSelectors;
     //   Selector   Boolean
     mapping(bytes4 => bool) public exactINSelectors;
-
-    event TokensRewarded(address indexed user, address indexed token, uint256 amount);
-
-    // Ranking variables
-    address private _userLock = address(1); // TODO: Convert to transient storage
-
-    uint256 private constant _FEE_BASE = 100;
 
     //      USER                TOKEN       AMOUNT
     mapping(address => mapping(address => uint256)) internal s_deposits;
@@ -54,10 +54,18 @@ contract CombinedDAppControl is DAppControl {
     //      USER        POINTS
     mapping(address => uint256) public S_userPointBalances;
 
+    //      Ranking                         // Rebate (in Percentage)
+    mapping(IMevReturnRanking.RankingType => uint256) S_rankingRebate;
+
+    ILending public lending;
+
+    event TokensRewarded(address indexed user, address indexed token, uint256 amount);
+
     constructor(
         address _atlas,
         address _rewardToken,
-        address _uniswapV2Router02
+        address _uniswapV2Router02,
+        address _lendingContract
     )
         DAppControl(
             _atlas,
@@ -111,6 +119,27 @@ contract CombinedDAppControl is DAppControl {
         exactINSelectors[bytes4(IUniswapV2Router02.swapExactTokensForETHSupportingFeeOnTransferTokens.selector)] = true;
         exactINSelectors[bytes4(IUniswapV2Router01.swapExactETHForTokens.selector)] = true;
         exactINSelectors[bytes4(IUniswapV2Router02.swapExactETHForTokensSupportingFeeOnTransferTokens.selector)] = true;
+        S_rankingRebate[IMevReturnRanking.RankingType.LOW] = 1000; // 10% in bps
+        S_rankingRebate[IMevReturnRanking.RankingType.MEDIUM] = 3000; // 30% in bps
+        S_rankingRebate[IMevReturnRanking.RankingType.HIGH] = 9000; // 90% in bps
+
+        lending = ILending(_lending);
+    }
+
+    function BorrowPointProxyCall(
+        UserOperation calldata userOp,
+        address transferHelper,
+        bytes calldata transferData,
+        bytes32[] calldata solverOpHashes,
+        uint256 borrowPointAmount,
+        bool isBorrowFlashLoan
+    ) {
+        // We don't want to borrow more than the maximum points in the pool.
+        if (lending.getTotalAmount() > borrowPointAmount) {
+            borrowPointAmount = lending.getTotalAmount();
+        }
+
+        // TODO: use a transient storage to track the FlashLoan request
     }
 
     // V2RewardDAppControl functions
@@ -165,29 +194,23 @@ contract CombinedDAppControl is DAppControl {
         address tokenSold = abi.decode(data, (address));
         uint256 balance;
 
+        address user = _user();
+
         if (tokenSold == address(0)) {
             balance = address(this).balance;
             if (balance > 0) {
-                SafeTransferLib.safeTransferETH(_user(), balance);
+                balance = balance * S_rankingRebate[user] / ONE_BPS_BASIS;
+                SafeTransferLib.safeTransferETH(user, balance);
             }
         } else {
             balance = IERC20(tokenSold).balanceOf(address(this));
             if (balance > 0) {
-                SafeTransferLib.safeTransfer(tokenSold, _user(), balance);
+                balance = balance * S_rankingRebate[user] / ONE_BPS_BASIS;
+                SafeTransferLib.safeTransfer(tokenSold, user, balance);
             }
         }
-    }
-
-    // Ranking functions
-    function getUserRanking(address user) external view returns (IMevReturnRanking.RankingType) {
-        uint256 points = S_userPointBalances[user];
-        if (points == 0) {
-            return IMevReturnRanking.RankingType.LOW;
-        } else if (points < 100) {
-            return IMevReturnRanking.RankingType.MEDIUM;
-        } else {
-            return IMevReturnRanking.RankingType.HIGH;
-        }
+        // Increment point for future rebate
+        S_userPointBalances[_user] += 1;
     }
 
     // Modifiers from Ranking
@@ -251,5 +274,17 @@ contract CombinedDAppControl is DAppControl {
 
     function getBidValue(SolverOperation calldata solverOp) public pure override returns (uint256) {
         return solverOp.bidAmount;
+    }
+
+    // Ranking functions
+    function getUserRanking(address user) external view returns (IMevReturnRanking.RankingType) {
+        uint256 points = S_userPointBalances[user];
+        if (points == 0) {
+            return IMevReturnRanking.RankingType.LOW;
+        } else if (points < 100) {
+            return IMevReturnRanking.RankingType.MEDIUM;
+        } else {
+            return IMevReturnRanking.RankingType.HIGH;
+        }
     }
 }

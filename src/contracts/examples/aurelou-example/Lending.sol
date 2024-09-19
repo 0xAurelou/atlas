@@ -4,6 +4,7 @@ pragma solidity ^0.8.25;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
+// TODO: Rewrite this with ERC4626
 contract Lending is ReentrancyGuard {
     struct UserAccount {
         uint256 collateralAmount;
@@ -15,6 +16,7 @@ contract Lending is ReentrancyGuard {
     IERC20 public lendingToken;
 
     mapping(address => UserAccount) public userAccounts;
+    uint256 totalAmount;
 
     uint256 public constant COLLATERAL_RATIO = 150; // 150% collateralization ratio
     uint256 public constant LIQUIDATION_THRESHOLD = 125; // 125% liquidation threshold
@@ -38,6 +40,7 @@ contract Lending is ReentrancyGuard {
         require(collateralToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
 
         userAccounts[msg.sender].collateralAmount = userAccounts[msg.sender].collateralAmount + (amount);
+        totalAmount += amount;
 
         emit Deposit(msg.sender, amount);
     }
@@ -52,6 +55,7 @@ contract Lending is ReentrancyGuard {
         require(amount <= allowedWithdrawal, "Withdrawal would put account below collateral ratio");
 
         userAccounts[msg.sender].collateralAmount = userAccounts[msg.sender].collateralAmount - (amount);
+        totalAmount -= amount;
 
         require(collateralToken.transfer(msg.sender, amount), "Transfer failed");
 
@@ -141,5 +145,9 @@ contract Lending is ReentrancyGuard {
         uint256 collateralValue = account.collateralAmount * (100);
         uint256 debtValue = account.borrowedAmount * (LIQUIDATION_THRESHOLD);
         return collateralValue < debtValue;
+    }
+
+    function getTotalAmount() external view returns (uint256) {
+        return totalAmount;
     }
 }
