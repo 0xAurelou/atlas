@@ -2,126 +2,91 @@
 pragma solidity ^0.8.25;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract PointDutchAuction is ReentrancyGuard, Ownable {
-    IERC20 public pointToken;
-    address public wallet;
+contract DutchAuctionForPoints {
+    IERC20 public paymentToken;
+    address public lendingContract;
+
     uint256 public startPrice;
     uint256 public endPrice;
+    uint256 public auctionDuration;
     uint256 public startTime;
-    uint256 public endTime;
-    uint256 public totalTokens;
-    uint256 public tokensSold;
+    uint256 public pointsForSale;
+
     bool public auctionEnded;
 
-    event AuctionStarted(uint256 startTime, uint256 endTime);
-    event TokensPurchased(address indexed buyer, uint256 amount, uint256 price);
-    event AuctionEnded(uint256 endTime, uint256 tokensSold);
+    event AuctionStarted(uint256 startPrice, uint256 endPrice, uint256 duration);
+    event PointsPurchased(address buyer, uint256 amount, uint256 price);
+    event AuctionEnded(uint256 finalPrice);
 
-    constructor(
-        address _pointToken,
-        address _wallet,
-        uint256 _startPrice,
-        uint256 _endPrice,
-        uint256 _duration,
-        uint256 _totalTokens
-    )
-        Ownable(msg.sender)
-    {
-        require(_pointToken != address(0), "Invalid token address");
-        require(_wallet != address(0), "Invalid wallet address");
-        require(_startPrice > _endPrice, "Start price must be greater than end price");
-        require(_duration > 0, "Duration must be greater than zero");
-        require(_totalTokens > 0, "Total tokens must be greater than zero");
+    // Custom errors
+    error AuctionAlreadyEnded();
+    error InvalidPricing();
+    error InvalidDuration();
+    error AuctionNotStarted();
+    error InvalidAmount();
+    error InsufficientPointsAvailable();
+    error PaymentTransferFailed();
+    error AuctionCannotBeEndedYet();
 
-        pointToken = IERC20(_pointToken);
-        wallet = _wallet;
-        startPrice = _startPrice;
-        endPrice = _endPrice;
-        totalTokens = _totalTokens;
-
-        // Transfer tokens from owner to this contract
-        require(pointToken.transferFrom(msg.sender, address(this), _totalTokens), "Token transfer failed");
+    constructor(address _paymentToken, address _lendingContract) {
+        paymentToken = IERC20(_paymentToken);
+        lendingContract = _lendingContract;
     }
 
-    function startAuction() external onlyOwner {
-        require(!auctionEnded, "Auction has already ended");
-        require(startTime == 0, "Auction has already started");
+    function startAuction(uint256 _startPrice, uint256 _endPrice, uint256 _duration, uint256 _pointsForSale) external {
+        if (auctionEnded) revert AuctionAlreadyEnded();
+        if (_startPrice <= _endPrice) revert InvalidPricing();
+        if (_duration == 0) revert InvalidDuration();
 
+        startPrice = _startPrice;
+        endPrice = _endPrice;
+        auctionDuration = _duration;
         startTime = block.timestamp;
-        endTime = startTime + (endTime);
+        pointsForSale = _pointsForSale;
 
-        emit AuctionStarted(startTime, endTime);
+        emit AuctionStarted(startPrice, endPrice, auctionDuration);
     }
 
     function getCurrentPrice() public view returns (uint256) {
-        if (block.timestamp < startTime) {
-            return startPrice;
-        }
-        if (block.timestamp >= endTime) {
+        if (startTime == 0) revert AuctionNotStarted();
+
+        if (block.timestamp >= startTime + auctionDuration) {
             return endPrice;
         }
 
-        uint256 timeElapsed = block.timestamp - (startTime);
-        uint256 totalDuration = endTime - (startTime);
-        uint256 priceDrop = startPrice - (endPrice);
-
-        return startPrice - (priceDrop * (timeElapsed) / (totalDuration));
+        uint256 elapsed = block.timestamp - startTime;
+        uint256 priceDrop = ((startPrice - endPrice) * elapsed) / auctionDuration;
+        return startPrice - priceDrop;
     }
 
-    function buy() external payable nonReentrant {
-        require(startTime > 0, "Auction has not started");
-        require(!auctionEnded, "Auction has ended");
-        require(block.timestamp < endTime, "Auction has expired");
+    function buyPoints(uint256 amount) external {
+        if (auctionEnded) revert AuctionAlreadyEnded();
+        if (amount == 0) revert InvalidAmount();
+        if (amount > pointsForSale) revert InsufficientPointsAvailable();
 
-        uint256 currentPrice = getCurrentPrice();
-        uint256 tokensToBuy = msg.value / (currentPrice);
-        require(tokensToBuy > 0, "Not enough ETH sent");
-        require(tokensSold + (tokensToBuy) <= totalTokens, "Not enough tokens available");
+        uint256 price = getCurrentPrice();
+        uint256 totalCost = price * amount;
 
-        uint256 cost = tokensToBuy * (currentPrice);
-        uint256 refund = msg.value - (cost);
+        if (!paymentToken.transferFrom(msg.sender, address(this), totalCost)) revert PaymentTransferFailed();
 
-        tokensSold = tokensSold + (tokensToBuy);
+        // Transfer points to the buyer (implement this in the LendingWithPoints contract)
+        // LendingWithPoints(lendingContract).transferPoints(msg.sender, amount);
 
-        require(pointToken.transfer(msg.sender, tokensToBuy), "Token transfer failed");
+        pointsForSale -= amount;
 
-        if (refund > 0) {
-            payable(msg.sender).transfer(refund);
-        }
+        emit PointsPurchased(msg.sender, amount, price);
 
-        payable(wallet).transfer(cost);
-
-        emit TokensPurchased(msg.sender, tokensToBuy, currentPrice);
-
-        if (tokensSold == totalTokens) {
+        if (pointsForSale == 0) {
             endAuction();
         }
     }
 
     function endAuction() public {
-        require(startTime > 0, "Auction has not started");
-        require(!auctionEnded, "Auction has already ended");
-        require(block.timestamp >= endTime || tokensSold == totalTokens, "Auction cannot be ended yet");
+        if (auctionEnded) revert AuctionAlreadyEnded();
+        if (block.timestamp < startTime + auctionDuration && pointsForSale > 0) revert AuctionCannotBeEndedYet();
 
         auctionEnded = true;
-
-        if (tokensSold < totalTokens) {
-            uint256 remainingTokens = totalTokens - (tokensSold);
-            require(pointToken.transfer(wallet, remainingTokens), "Token transfer failed");
-        }
-
-        emit AuctionEnded(block.timestamp, tokensSold);
-    }
-
-    function withdrawUnsoldTokens() external onlyOwner {
-        require(auctionEnded, "Auction has not ended");
-
-        uint256 unsoldTokens = pointToken.balanceOf(address(this));
-        require(unsoldTokens > 0, "No unsold tokens");
-
-        require(pointToken.transfer(owner(), unsoldTokens), "Token transfer failed");
+        emit AuctionEnded(getCurrentPrice());
     }
 }

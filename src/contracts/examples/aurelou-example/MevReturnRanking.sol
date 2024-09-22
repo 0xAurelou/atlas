@@ -19,7 +19,7 @@ import {
 
 import { IMevReturnRanking } from "src/contracts/examples/aurelou-example/interfaces/IMevReturnRanking.sol";
 
-import { ILending } from "src/contracts/examples/aurelou-example/interfaces/ILending.sol";
+import { IPool } from "src/contracts/examples/aurelou-example/interfaces/IPool.sol";
 
 /*
 * @title CombinedDAppControl
@@ -27,6 +27,7 @@ import { ILending } from "src/contracts/examples/aurelou-example/interfaces/ILen
 * @dev This contract inherits from DAppControl and implements both reward and ranking systems
 */
 contract CombinedDAppControl is DAppControl {
+    bytes32 constant SLOT = 0;
     address public immutable REWARD_TOKEN;
     address public immutable uniswapV2Router02;
 
@@ -60,6 +61,17 @@ contract CombinedDAppControl is DAppControl {
     ILending public lending;
 
     event TokensRewarded(address indexed user, address indexed token, uint256 amount);
+
+    modifier lockFlashloan() {
+        assembly {
+            if tload(SLOT) { revert(0, 0) }
+            tstore(SLOT, 1)
+        }
+        _;
+        assembly {
+            tstore(SLOT, 0)
+        }
+    }
 
     constructor(
         address _atlas,
@@ -126,20 +138,89 @@ contract CombinedDAppControl is DAppControl {
         lending = ILending(_lending);
     }
 
-    function BorrowPointProxyCall(
+    // 1 point = 0.01 ETH
+    function BorrowPointFlashloanProxyCall(
         UserOperation calldata userOp,
         address transferHelper,
         bytes calldata transferData,
         bytes32[] calldata solverOpHashes,
-        uint256 borrowPointAmount,
-        bool isBorrowFlashLoan
-    ) {
+        uint256 borrowPointAmount
+    )
+        external
+        lockFlashloan
+    {
         // We don't want to borrow more than the maximum points in the pool.
         if (lending.getTotalAmount() > borrowPointAmount) {
             borrowPointAmount = lending.getTotalAmount();
         }
 
-        // TODO: use a transient storage to track the FlashLoan request
+        uint256 tmpUserPoint = S_userPointBalances[userOp.from];
+
+        if (isBorrowFlashLoan) {
+            tmpUserPoint += borrowPointAmount;
+        }
+
+        // Decode the token information
+        (Approval[] memory _approvals,,,,) =
+            abi.decode(userOp.data[4:], (Approval[], address[], Beneficiary[], address, bytes));
+
+        // Process token transfers if necessary.  If transferHelper == address(0), skip.
+        if (transferHelper != address(0)) {
+            (bool _success, bytes memory _data) = transferHelper.call(transferData);
+            if (!_success) {
+                assembly {
+                    revert(add(_data, 32), mload(_data))
+                }
+            }
+
+            // Get the execution environment address
+            (address _environment,,) = IAtlas(ATLAS).getExecutionEnvironment(userOp.from, CONTROL);
+
+            uint256 approvalLength = _approvals.length;
+            for (uint256 i; i < approvalLength;) {
+                uint256 _balance = IERC20(_approvals[i].token).balanceOf(address(this));
+                if (_balance != 0) {
+                    IERC20(_approvals[i].token).transfer(_environment, _balance);
+                }
+                unchecked {
+                    ++i;
+                }
+            }
+        }
+
+        bytes32 _userOpHash = IAtlasVerification(ATLAS_VERIFICATION).getUserOperationHash(userOp);
+
+        DAppOperation memory _dAppOp = DAppOperation({
+            from: address(this), // signer of the DAppOperation
+            to: ATLAS, // Atlas address
+            nonce: 0, // Atlas nonce of the DAppOperation available in the AtlasVerification contract
+            deadline: userOp.deadline, // block.number deadline for the DAppOperation
+            control: address(this), // DAppControl address
+            bundler: address(this), // Signer of the atlas tx (msg.sender)
+            userOpHash: _userOpHash, // keccak256 of userOp.to, userOp.data
+            callChainHash: bytes32(0), // keccak256 of the solvers' txs
+            signature: new bytes(0) // DAppOperation signed by DAppOperation.from
+         });
+
+        SolverOperation[] memory _solverOps = _getSolverOps(solverOpHashes);
+
+        (bool _success, bytes memory _data) =
+            ATLAS.call{ value: msg.value }(abi.encodeCall(IAtlas.metacall, (userOp, _solverOps, _dAppOp)));
+        if (!_success) {
+            assembly {
+                revert(add(_data, 32), mload(_data))
+            }
+        }
+
+        // Return the flashloan amount to the user
+        if (isBorrowFlashLoan) {
+            lending.asset().transfer(address(lending), borrowPointAmount);
+            SafeTransferLib.safeTransferETH(, amount);
+        }
+
+        if (address(this).balance > _bundlerRefundTracker) {
+            SafeTransferLib.safeTransferETH(msg.sender, address(this).balance - _bundlerRefundTracker);
+        }
     }
 
     // V2RewardDAppControl functions
