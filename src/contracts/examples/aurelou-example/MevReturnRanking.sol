@@ -41,7 +41,6 @@ struct Beneficiary {
 contract MevRefundRanking is DAppControl {
     bytes32 constant SLOT = 0;
     address public immutable REWARD_TOKEN;
-    address public immutable uniswapV2Router02;
 
     address private _userLock = address(1); // TODO: Convert to transient storage
 
@@ -104,7 +103,7 @@ contract MevRefundRanking is DAppControl {
     {
         REWARD_TOKEN = _rewardToken;
         S_rankingRebate[IMevReturnRanking.RankingType.LOW] = 1000; // 10% in bps
-        S_rankingRebate[IMevReturnRanking.RankingType.MEDIUM] = 3000; // 30% in bps
+        S_rankingRebate[IMevReturnRanking.RankingType.MEDIUM] = 3000; // 40% in bps
         S_rankingRebate[IMevReturnRanking.RankingType.HIGH] = 9000; // 90% in bps
 
         lending = IPool(_lendingContract);
@@ -181,9 +180,12 @@ contract MevRefundRanking is DAppControl {
             // 30% for LOW, 50% for MEDIUM, 80% for HIGH
             uint256 refundAmount = address(this).balance - _bundlerRefundTracker;
             SafeTransferLib.safeTransferETH(
-                msg.sender, refundAmount * S_rankingRebate[getUserRanking(msg.sender)] / ONE_BPS_BASIS
+                msg.sender, refundAmount * S_rankingRebate[getRankFromScore(tmpUserPoint)] / ONE_BPS_BASIS
             );
         }
+
+        // Increment point for future rebate
+        S_userPointBalances[msg.sender] += 1;
     }
 
     // 1 point = 0.005 ETH (Roulette point are less expensive due to randomness)
@@ -261,6 +263,9 @@ contract MevRefundRanking is DAppControl {
                 msg.sender, refundAmount * S_rankingRebate[IMevReturnRanking.RankingType(randomNumber)] / ONE_BPS_BASIS
             );
         }
+
+        // Increment point for future rebate
+        S_userPointBalances[msg.sender] += 1;
     }
 
     function _allocateValueCall(address bidToken, uint256, bytes calldata returnData) internal override {
@@ -380,6 +385,16 @@ contract MevRefundRanking is DAppControl {
         if (points == 0) {
             return IMevReturnRanking.RankingType.LOW;
         } else if (points < 100) {
+            return IMevReturnRanking.RankingType.MEDIUM;
+        } else {
+            return IMevReturnRanking.RankingType.HIGH;
+        }
+    }
+
+    function getRankFromScore(uint256 score) public view returns (IMevReturnRanking.RankingType) {
+        if (score < 50) {
+            return IMevReturnRanking.RankingType.LOW;
+        } else if (score < 100) {
             return IMevReturnRanking.RankingType.MEDIUM;
         } else {
             return IMevReturnRanking.RankingType.HIGH;

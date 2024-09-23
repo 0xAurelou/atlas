@@ -13,8 +13,6 @@ contract Pool is IPool, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     IERC20 public immutable pointsToken;
-    uint256 public constant FLASH_LOAN_FEE = 9; // 0.09% fee
-    uint256 public constant FLASH_LOAN_FEE_DENOMINATOR = 10_000;
     bytes32 public constant FLASHLOAN_ROLE = keccak256("FLASHLOAN_ROLE");
 
     uint256 public totalFees;
