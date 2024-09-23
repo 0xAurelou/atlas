@@ -7,13 +7,31 @@ import { IERC20 } from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol"
 
 // Atlas Imports
 import { DAppControl } from "src/contracts/dapp/DAppControl.sol";
+import { DAppOperation } from "src/contracts/types/DAppOperation.sol";
 import { CallConfig } from "src/contracts/types/ConfigTypes.sol";
 import { UserOperation } from "src/contracts/types/UserOperation.sol";
 import { SolverOperation } from "src/contracts/types/SolverOperation.sol";
+import "src/contracts/types/LockTypes.sol";
+import { CallConfig } from "src/contracts/types/ConfigTypes.sol";
+
+// Interface Import
 
 import { IMevReturnRanking } from "src/contracts/examples/aurelou-example/interfaces/IMevReturnRanking.sol";
-
 import { IPool } from "src/contracts/examples/aurelou-example/interfaces/IPool.sol";
+import { IAtlasVerification } from "src/contracts/interfaces/IAtlasVerification.sol";
+import { IExecutionEnvironment } from "src/contracts/interfaces/IExecutionEnvironment.sol";
+import { IAtlas } from "src/contracts/interfaces/IAtlas.sol";
+
+struct Approval {
+    address token;
+    address spender;
+    uint256 amount;
+}
+
+struct Beneficiary {
+    address owner;
+    uint256 percentage; // out of 100
+}
 
 /*
 * @title MevRefundRanking
@@ -25,19 +43,12 @@ contract MevRefundRanking is DAppControl {
     address public immutable REWARD_TOKEN;
     address public immutable uniswapV2Router02;
 
-    // Ranking variables
     address private _userLock = address(1); // TODO: Convert to transient storage
 
+    uint256 private constant _FEE_BASE = 100;
     uint256 public constant ONE_BPS_BASIS = 10_000;
     uint256 public constant ONE = 1e18;
     uint256 public constant ONE_POINT_PRICE = 0.01 ether;
-
-    //   Selector   Boolean
-    mapping(bytes4 => bool) public ERC20StartingSelectors;
-    //   Selector   Boolean
-    mapping(bytes4 => bool) public ETHStartingSelectors;
-    //   Selector   Boolean
-    mapping(bytes4 => bool) public exactINSelectors;
 
     //      USER                TOKEN       AMOUNT
     mapping(address => mapping(address => uint256)) internal s_deposits;
@@ -54,7 +65,7 @@ contract MevRefundRanking is DAppControl {
     //      Ranking                         // Rebate (in Percentage)
     mapping(IMevReturnRanking.RankingType => uint256) S_rankingRebate;
 
-    ILending public lending;
+    IPool public lending;
 
     event TokensRewarded(address indexed user, address indexed token, uint256 amount);
 
@@ -96,7 +107,7 @@ contract MevRefundRanking is DAppControl {
         S_rankingRebate[IMevReturnRanking.RankingType.MEDIUM] = 3000; // 30% in bps
         S_rankingRebate[IMevReturnRanking.RankingType.HIGH] = 9000; // 90% in bps
 
-        lending = ILending(_lending);
+        lending = IPool(_lendingContract);
     }
 
     // 1 point = 0.01 ETH
@@ -108,6 +119,7 @@ contract MevRefundRanking is DAppControl {
         uint256 borrowPointAmount
     )
         external
+        payable
         withUserLock(userOp.from)
         onlyAsControl
     {
@@ -117,10 +129,7 @@ contract MevRefundRanking is DAppControl {
         }
 
         uint256 tmpUserPoint = S_userPointBalances[userOp.from];
-
-        if (isBorrowFlashLoan) {
-            tmpUserPoint += borrowPointAmount;
-        }
+        tmpUserPoint += borrowPointAmount;
 
         // Decode the token information
         (Approval[] memory _approvals,,,,) =
@@ -150,42 +159,28 @@ contract MevRefundRanking is DAppControl {
             }
         }
 
-        bytes32 _userOpHash = IAtlasVerification(ATLAS_VERIFICATION).getUserOperationHash(userOp);
+        uint256 _bundlerRefundTracker = address(this).balance - msg.value;
 
-        DAppOperation memory _dAppOp = DAppOperation({
-            from: address(this), // signer of the DAppOperation
-            to: ATLAS, // Atlas address
-            nonce: 0, // Atlas nonce of the DAppOperation available in the AtlasVerification contract
-            deadline: userOp.deadline, // block.number deadline for the DAppOperation
-            control: address(this), // DAppControl address
-            bundler: address(this), // Signer of the atlas tx (msg.sender)
-            userOpHash: _userOpHash, // keccak256 of userOp.to, userOp.data
-            callChainHash: bytes32(0), // keccak256 of the solvers' txs
-            signature: new bytes(0) // DAppOperation signed by DAppOperation.from
-         });
-
-        SolverOperation[] memory _solverOps = _getSolverOps(solverOpHashes);
-
-        (bool _success, bytes memory _data) =
-            ATLAS.call{ value: msg.value }(abi.encodeCall(IAtlas.metacall, (userOp, _solverOps, _dAppOp)));
-        if (!_success) {
-            assembly {
-                revert(add(_data, 32), mload(_data))
+        {
+            (bool _success, bytes memory _data) =
+                ATLAS.call{ value: msg.value }(abi.encodeCall(IAtlas.metacall, (userOp, _solverOps, _dAppOp)));
+            if (!_success) {
+                assembly {
+                    revert(add(_data, 32), mload(_data))
+                }
             }
         }
 
-        // Return the flashloan amount to the user
-        if (isBorrowFlashLoan) {
-            address lendingAddr = address(lending);
-            lending.asset().transfer(lendingAddr, borrowPointAmount);
-            SafeTransferLib.safeTransferETH(lendingAddr, borrowPointAmount / ONE * ONE_POINT_PRICE);
-        }
+        // Return the flashloan amount to the pool
+        address lendingAddr = address(lending);
+        IERC20(lending.getPointsToken()).transfer(lendingAddr, borrowPointAmount);
+        SafeTransferLib.safeTransferETH(lendingAddr, borrowPointAmount / ONE * ONE_POINT_PRICE);
 
         if (address(this).balance > _bundlerRefundTracker) {
             // Refund depending on the user RankingType
             // 30% for LOW, 50% for MEDIUM, 80% for HIGH
             uint256 refundAmount = address(this).balance - _bundlerRefundTracker;
-            IMevReturnRanking userRanking = SafeTransferLib.safeTransferETH(
+            SafeTransferLib.safeTransferETH(
                 msg.sender, refundAmount * S_rankingRebate[getUserRanking(msg.sender)] / ONE_BPS_BASIS
             );
         }
@@ -199,6 +194,7 @@ contract MevRefundRanking is DAppControl {
         bytes32[] calldata solverOpHashes
     )
         external
+        payable
         withUserLock(userOp.from)
         onlyAsControl
     {
@@ -229,6 +225,8 @@ contract MevRefundRanking is DAppControl {
                 }
             }
         }
+
+        uint256 _bundlerRefundTracker = address(this).balance - msg.value;
 
         bytes32 _userOpHash = IAtlasVerification(ATLAS_VERIFICATION).getUserOperationHash(userOp);
 
@@ -259,8 +257,8 @@ contract MevRefundRanking is DAppControl {
             // 30% for LOW, 50% for MEDIUM, 80% for HIGH
             uint256 refundAmount = address(this).balance - _bundlerRefundTracker;
             uint256 randomNumber = block.prevrandao;
-            IMevReturnRanking userRanking = SafeTransferLib.safeTransferETH(
-                msg.sender, refundAmount * S_rankingRebate[randomNumber] / ONE_BPS_BASIS
+            SafeTransferLib.safeTransferETH(
+                msg.sender, refundAmount * S_rankingRebate[IMevReturnRanking.RankingType(randomNumber)] / ONE_BPS_BASIS
             );
         }
     }
@@ -299,18 +297,18 @@ contract MevRefundRanking is DAppControl {
         if (tokenSold == address(0)) {
             balance = address(this).balance;
             if (balance > 0) {
-                balance = balance * S_rankingRebate[user] / ONE_BPS_BASIS;
+                balance = balance * S_rankingRebate[getUserRanking(user)] / ONE_BPS_BASIS;
                 SafeTransferLib.safeTransferETH(user, balance);
             }
         } else {
             balance = IERC20(tokenSold).balanceOf(address(this));
             if (balance > 0) {
-                balance = balance * S_rankingRebate[user] / ONE_BPS_BASIS;
+                balance = balance * S_rankingRebate[getUserRanking(user)] / ONE_BPS_BASIS;
                 SafeTransferLib.safeTransfer(tokenSold, user, balance);
             }
         }
         // Increment point for future rebate
-        S_userPointBalances[_user] += 1;
+        S_userPointBalances[user] += 1;
     }
 
     // Modifiers from Ranking
@@ -377,7 +375,7 @@ contract MevRefundRanking is DAppControl {
     }
 
     // Ranking functions
-    function getUserRanking(address user) external view returns (IMevReturnRanking.RankingType) {
+    function getUserRanking(address user) public view returns (IMevReturnRanking.RankingType) {
         uint256 points = S_userPointBalances[user];
         if (points == 0) {
             return IMevReturnRanking.RankingType.LOW;

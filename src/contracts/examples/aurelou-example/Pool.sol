@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.25;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
-import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import { ReentrancyGuard } from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
+import "openzeppelin-contracts/contracts/utils/Pausable.sol";
+import "openzeppelin-contracts/contracts/utils/cryptography/MerkleProof.sol";
 
-interface IFlashLoanReceiver {
-    function executeOperation(uint256 amount, uint256 fee, bytes calldata params) external returns (bool);
-}
+import { IPool } from "./interfaces/IPool.sol";
 
-contract PointsVaultWithETHRewards is ReentrancyGuard, Pausable {
+contract Pool is IPool, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     IERC20 public immutable pointsToken;
@@ -76,28 +74,6 @@ contract PointsVaultWithETHRewards is ReentrancyGuard, Pausable {
         emit Withdraw(msg.sender, amount);
     }
 
-    function flashLoan(address receiver, uint256 amount) external nonReentrant whenNotPaused onlyFlashloan {
-        if (pointsToken.balanceOf(address(this)) < amount) revert InsufficientBalance();
-        uint256 fee = (amount * FLASH_LOAN_FEE) / FLASH_LOAN_FEE_DENOMINATOR;
-
-        // Transfer the amount to the receiver
-        pointsToken.safeTransfer(receiver, amount);
-        emit FlashLoanTaken(receiver, amount);
-
-        // Execute the flash loan operation
-        if (!IFlashLoanReceiver(receiver).executeOperation(amount, fee, "")) {
-            revert FlashLoanExecutionFailed();
-        }
-
-        // Check if the loan plus fee has been returned
-        if (pointsToken.balanceOf(address(this)) < totalSupply + fee) {
-            revert FlashLoanExecutionFailed();
-        }
-
-        totalFees += fee;
-        emit FlashLoan(receiver, amount, fee);
-    }
-
     function totalAssets() public view returns (uint256) {
         return pointsToken.balanceOf(address(this));
     }
@@ -117,6 +93,14 @@ contract PointsVaultWithETHRewards is ReentrancyGuard, Pausable {
         claimedFees[msg.sender] = amount;
         payable(msg.sender).transfer(claimableAmount);
         emit FeeClaimed(msg.sender, claimableAmount);
+    }
+
+    function getPointsToken() external view returns (address) {
+        return address(pointsToken);
+    }
+
+    function getTotalAmount() external view returns (uint256) {
+        return pointsToken.balanceOf(address(this));
     }
 
     // Emergency functions
