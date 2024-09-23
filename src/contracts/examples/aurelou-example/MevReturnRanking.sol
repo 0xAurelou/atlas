@@ -11,22 +11,16 @@ import { CallConfig } from "src/contracts/types/ConfigTypes.sol";
 import { UserOperation } from "src/contracts/types/UserOperation.sol";
 import { SolverOperation } from "src/contracts/types/SolverOperation.sol";
 
-// Uniswap Imports
-import {
-    IUniswapV2Router01,
-    IUniswapV2Router02
-} from "src/contracts/examples/aurelou-example/interfaces/IUniswapV2Router.sol";
-
 import { IMevReturnRanking } from "src/contracts/examples/aurelou-example/interfaces/IMevReturnRanking.sol";
 
 import { IPool } from "src/contracts/examples/aurelou-example/interfaces/IPool.sol";
 
 /*
-* @title CombinedDAppControl
+* @title MevRefundRanking
 * @notice This contract combines functionalities of V2RewardDAppControl and Ranking
 * @dev This contract inherits from DAppControl and implements both reward and ranking systems
 */
-contract CombinedDAppControl is DAppControl {
+contract MevRefundRanking is DAppControl {
     bytes32 constant SLOT = 0;
     address public immutable REWARD_TOKEN;
     address public immutable uniswapV2Router02;
@@ -35,6 +29,8 @@ contract CombinedDAppControl is DAppControl {
     address private _userLock = address(1); // TODO: Convert to transient storage
 
     uint256 public constant ONE_BPS_BASIS = 10_000;
+    uint256 public constant ONE = 1e18;
+    uint256 public constant ONE_POINT_PRICE = 0.01 ether;
 
     //   Selector   Boolean
     mapping(bytes4 => bool) public ERC20StartingSelectors;
@@ -62,21 +58,9 @@ contract CombinedDAppControl is DAppControl {
 
     event TokensRewarded(address indexed user, address indexed token, uint256 amount);
 
-    modifier lockFlashloan() {
-        assembly {
-            if tload(SLOT) { revert(0, 0) }
-            tstore(SLOT, 1)
-        }
-        _;
-        assembly {
-            tstore(SLOT, 0)
-        }
-    }
-
     constructor(
         address _atlas,
         address _rewardToken,
-        address _uniswapV2Router02,
         address _lendingContract
     )
         DAppControl(
@@ -108,29 +92,6 @@ contract CombinedDAppControl is DAppControl {
         )
     {
         REWARD_TOKEN = _rewardToken;
-        uniswapV2Router02 = _uniswapV2Router02;
-
-        ERC20StartingSelectors[bytes4(IUniswapV2Router01.swapExactTokensForTokens.selector)] = true;
-        ERC20StartingSelectors[bytes4(IUniswapV2Router01.swapTokensForExactTokens.selector)] = true;
-        ERC20StartingSelectors[bytes4(IUniswapV2Router01.swapTokensForExactETH.selector)] = true;
-        ERC20StartingSelectors[bytes4(IUniswapV2Router01.swapExactTokensForETH.selector)] = true;
-        ERC20StartingSelectors[bytes4(IUniswapV2Router02.swapExactTokensForTokensSupportingFeeOnTransferTokens.selector)]
-        = true;
-        ERC20StartingSelectors[bytes4(IUniswapV2Router02.swapExactTokensForETHSupportingFeeOnTransferTokens.selector)] =
-            true;
-
-        ETHStartingSelectors[bytes4(IUniswapV2Router01.swapExactETHForTokens.selector)] = true;
-        ETHStartingSelectors[bytes4(IUniswapV2Router01.swapETHForExactTokens.selector)] = true;
-        ETHStartingSelectors[bytes4(IUniswapV2Router02.swapExactETHForTokensSupportingFeeOnTransferTokens.selector)] =
-            true;
-
-        exactINSelectors[bytes4(IUniswapV2Router01.swapExactTokensForTokens.selector)] = true;
-        exactINSelectors[bytes4(IUniswapV2Router01.swapExactTokensForETH.selector)] = true;
-        exactINSelectors[bytes4(IUniswapV2Router02.swapExactTokensForTokensSupportingFeeOnTransferTokens.selector)] =
-            true;
-        exactINSelectors[bytes4(IUniswapV2Router02.swapExactTokensForETHSupportingFeeOnTransferTokens.selector)] = true;
-        exactINSelectors[bytes4(IUniswapV2Router01.swapExactETHForTokens.selector)] = true;
-        exactINSelectors[bytes4(IUniswapV2Router02.swapExactETHForTokensSupportingFeeOnTransferTokens.selector)] = true;
         S_rankingRebate[IMevReturnRanking.RankingType.LOW] = 1000; // 10% in bps
         S_rankingRebate[IMevReturnRanking.RankingType.MEDIUM] = 3000; // 30% in bps
         S_rankingRebate[IMevReturnRanking.RankingType.HIGH] = 9000; // 90% in bps
@@ -147,7 +108,8 @@ contract CombinedDAppControl is DAppControl {
         uint256 borrowPointAmount
     )
         external
-        lockFlashloan
+        withUserLock(userOp.from)
+        onlyAsControl
     {
         // We don't want to borrow more than the maximum points in the pool.
         if (lending.getTotalAmount() > borrowPointAmount) {
@@ -214,61 +176,118 @@ contract CombinedDAppControl is DAppControl {
 
         // Return the flashloan amount to the user
         if (isBorrowFlashLoan) {
-            lending.asset().transfer(address(lending), borrowPointAmount);
-            SafeTransferLib.safeTransferETH(, amount);
+            address lendingAddr = address(lending);
+            lending.asset().transfer(lendingAddr, borrowPointAmount);
+            SafeTransferLib.safeTransferETH(lendingAddr, borrowPointAmount / ONE * ONE_POINT_PRICE);
         }
 
         if (address(this).balance > _bundlerRefundTracker) {
-            SafeTransferLib.safeTransferETH(msg.sender, address(this).balance - _bundlerRefundTracker);
+            // Refund depending on the user RankingType
+            // 30% for LOW, 50% for MEDIUM, 80% for HIGH
+            uint256 refundAmount = address(this).balance - _bundlerRefundTracker;
+            IMevReturnRanking userRanking = SafeTransferLib.safeTransferETH(
+                msg.sender, refundAmount * S_rankingRebate[getUserRanking(msg.sender)] / ONE_BPS_BASIS
+            );
         }
     }
 
-    // V2RewardDAppControl functions
-    function getTokenSold(bytes calldata userData) external view returns (address tokenSold, uint256 amountSold) {
-        bytes4 funcSelector = bytes4(userData);
+    // 1 point = 0.005 ETH (Roulette point are less expensive due to randomness)
+    function RouletteBundleRefundProxyCall(
+        UserOperation calldata userOp,
+        address transferHelper,
+        bytes calldata transferData,
+        bytes32[] calldata solverOpHashes
+    )
+        external
+        withUserLock(userOp.from)
+        onlyAsControl
+    {
+        // Decode the token information
+        (Approval[] memory _approvals,,,,) =
+            abi.decode(userOp.data[4:], (Approval[], address[], Beneficiary[], address, bytes));
 
-        require(
-            ERC20StartingSelectors[funcSelector] || ETHStartingSelectors[funcSelector],
-            "CombinedDAppControl: InvalidFunction"
-        );
-
-        if (ERC20StartingSelectors[funcSelector]) {
-            address[] memory path;
-
-            if (exactINSelectors[funcSelector]) {
-                (amountSold,, path,,) = abi.decode(userData[4:], (uint256, uint256, address[], address, uint256));
-            } else {
-                (, amountSold, path,,) = abi.decode(userData[4:], (uint256, uint256, address[], address, uint256));
+        // Process token transfers if necessary.  If transferHelper == address(0), skip.
+        if (transferHelper != address(0)) {
+            (bool _success, bytes memory _data) = transferHelper.call(transferData);
+            if (!_success) {
+                assembly {
+                    revert(add(_data, 32), mload(_data))
+                }
             }
 
-            tokenSold = path[0];
+            // Get the execution environment address
+            (address _environment,,) = IAtlas(ATLAS).getExecutionEnvironment(userOp.from, CONTROL);
+
+            uint256 approvalLength = _approvals.length;
+            for (uint256 i; i < approvalLength;) {
+                uint256 _balance = IERC20(_approvals[i].token).balanceOf(address(this));
+                if (_balance != 0) {
+                    IERC20(_approvals[i].token).transfer(_environment, _balance);
+                }
+                unchecked {
+                    ++i;
+                }
+            }
+        }
+
+        bytes32 _userOpHash = IAtlasVerification(ATLAS_VERIFICATION).getUserOperationHash(userOp);
+
+        DAppOperation memory _dAppOp = DAppOperation({
+            from: address(this), // signer of the DAppOperation
+            to: ATLAS, // Atlas address
+            nonce: 0, // Atlas nonce of the DAppOperation available in the AtlasVerification contract
+            deadline: userOp.deadline, // block.number deadline for the DAppOperation
+            control: address(this), // DAppControl address
+            bundler: address(this), // Signer of the atlas tx (msg.sender)
+            userOpHash: _userOpHash, // keccak256 of userOp.to, userOp.data
+            callChainHash: bytes32(0), // keccak256 of the solvers' txs
+            signature: new bytes(0) // DAppOperation signed by DAppOperation.from
+         });
+
+        SolverOperation[] memory _solverOps = _getSolverOps(solverOpHashes);
+
+        (bool _success, bytes memory _data) =
+            ATLAS.call{ value: msg.value }(abi.encodeCall(IAtlas.metacall, (userOp, _solverOps, _dAppOp)));
+        if (!_success) {
+            assembly {
+                revert(add(_data, 32), mload(_data))
+            }
+        }
+
+        if (address(this).balance > _bundlerRefundTracker) {
+            // Refund depending on the user RankingType
+            // 30% for LOW, 50% for MEDIUM, 80% for HIGH
+            uint256 refundAmount = address(this).balance - _bundlerRefundTracker;
+            uint256 randomNumber = block.prevrandao;
+            IMevReturnRanking userRanking = SafeTransferLib.safeTransferETH(
+                msg.sender, refundAmount * S_rankingRebate[randomNumber] / ONE_BPS_BASIS
+            );
         }
     }
 
-    function _checkUserOperation(UserOperation memory userOp) internal view override {
-        require(userOp.dapp == uniswapV2Router02, "CombinedDAppControl: InvalidDestination");
-    }
+    function _allocateValueCall(address bidToken, uint256, bytes calldata returnData) internal override {
+        // NOTE: The _user() receives any remaining balance after the other beneficiaries are paid.
+        Beneficiary[] memory _beneficiaries = abi.decode(returnData, (Beneficiary[]));
 
-    function _preOpsCall(UserOperation calldata userOp) internal override returns (bytes memory) {
-        (address tokenSold, uint256 amountSold) = this.getTokenSold(userOp.data);
+        uint256 _unallocatedPercent = _FEE_BASE;
+        uint256 _balance = address(this).balance;
 
-        _getAndApproveUserERC20(tokenSold, amountSold, uniswapV2Router02);
-
-        return abi.encode(tokenSold);
-    }
-
-    function _allocateValueCall(address bidToken, uint256 bidAmount, bytes calldata) internal override {
-        require(bidToken == REWARD_TOKEN, "CombinedDAppControl: InvalidBidToken");
-
-        address user = _user();
-
-        if (bidToken == address(0)) {
-            SafeTransferLib.safeTransferETH(user, bidAmount);
-        } else {
-            SafeTransferLib.safeTransfer(REWARD_TOKEN, user, bidAmount);
+        // Return the receivable tokens to the user
+        uint256 beneficiariesLength = _beneficiaries.length;
+        for (uint256 i; i < beneficiariesLength; i++) {
+            uint256 _percentage = _beneficiaries[i].percentage;
+            if (_percentage < _unallocatedPercent) {
+                _unallocatedPercent -= _percentage;
+                SafeTransferLib.safeTransferETH(_beneficiaries[i].owner, _balance * _percentage / _FEE_BASE);
+            } else {
+                SafeTransferLib.safeTransferETH(_beneficiaries[i].owner, address(this).balance);
+            }
         }
 
-        emit TokensRewarded(user, REWARD_TOKEN, bidAmount);
+        // Transfer the remaining value to the user
+        if (_unallocatedPercent != 0) {
+            SafeTransferLib.safeTransferETH(_user(), address(this).balance);
+        }
     }
 
     function _postOpsCall(bool, bytes calldata data) internal override {
